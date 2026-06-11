@@ -4,24 +4,24 @@
 #include <DFRobotDFPlayerMini.h>
 
 LiquidCrystal_I2C lcd(0x27, 16, 2);
-SoftwareSerial dfSerial(11, 9);
+SoftwareSerial dfSerial(11, 9); // RX=D11, TX=D9
 DFRobotDFPlayerMini dfPlayer;
 
-#define RESTART_BUTTON  2
-#define SHOOT_BUTTON    4
+#define SHOOT_BUTTON 4
 
 const char* playerNames[] = {"SHOKRY", "ZEYAD", "MOAZ", "YASSIN", "ADHAM"};
-int trackBase[]            = {1, 8, 15, 22, 29};
+int trackBase[]           = {1, 8, 15, 22, 29};
+int workingPlayers[]      = {0, 1, 2, 3}; // ADHAM removed from active track logic
 
-int workingPlayers[] = {0, 1, 2, 3}; // SHOKRY, ZEYAD, MOAZ, YASSIN (ADHAM removed)
+// Simple state tracking flags (No enum state machines)
+bool isGameActive    = false;
+bool isGameWon       = false;
+bool isGameLost      = false;
 
-enum GameState { STATE_INIT, STATE_PLAYING, STATE_WIN, STATE_LOSE };
-GameState state = STATE_INIT;
-
-int  allyIndex       = -1;
+int allyIndex        = -1;
 bool targetsHit[5]   = {false, false, false, false, false};
-int  targetsHitCount = 0;
-int  totalScore      = 0;
+int targetsHitCount  = 0;
+int totalScore       = 0;
 bool waitingForHit   = false;
 bool ballIsBig       = true;
 unsigned long endScreenTime = 0;
@@ -29,14 +29,6 @@ unsigned long endScreenTime = 0;
 void playTrack(int trackNum) {
   dfSerial.listen();
   dfPlayer.playMp3Folder(trackNum);
-}
-
-void sendToWorker(char a, char b, char c, char d) {
-  Serial.write(a);
-  Serial.write(b);
-  Serial.write(c);
-  Serial.write(d);
-  Serial.flush();
 }
 
 void updateLCD() {
@@ -59,18 +51,22 @@ void initGame() {
   totalScore      = 0;
   waitingForHit   = false;
   ballIsBig       = true;
+  isGameActive    = true;
+  isGameWon       = false;
+  isGameLost      = false;
 
-  sendToWorker('R','E','S','T');
+  // Single-byte Reset token to Worker
+  Serial.write('R');
+  Serial.flush();
   while (Serial.available()) Serial.read();
 
   randomSeed(analogRead(A0));
   allyIndex = random(0, 5);
 
-  Serial.write('A');
-  Serial.write('L');
-  Serial.write('L');
-  Serial.write('Y');
-  Serial.write((char)allyIndex);
+  // Sync token sequence to Processing.io over Bluetooth
+  Serial.print('I'); 
+  Serial.print(allyIndex + 1); // Processing expects 1-5 format
+  Serial.print('\n');
   Serial.flush();
 
   playTrack(trackBase[allyIndex]);
@@ -81,13 +77,10 @@ void initGame() {
   lcd.print(playerNames[allyIndex]);
   lcd.setCursor(0, 1);
   lcd.print("Sc:0  0/4 [BIG]");
-
-  state = STATE_PLAYING;
 }
 
 void setup() {
-  pinMode(RESTART_BUTTON, INPUT_PULLUP);
-  pinMode(SHOOT_BUTTON,   INPUT_PULLUP);
+  pinMode(SHOOT_BUTTON, INPUT_PULLUP);
 
   lcd.init();
   lcd.backlight();
@@ -107,106 +100,117 @@ void setup() {
   lcd.print("DFPlayer Ready");
   delay(1000);
 
-  Serial.begin(9600);
+  Serial.begin(9600); // Bluetooth Link & Worker Shared Bus
   delay(500);
   while (Serial.available()) Serial.read();
 
-  state = STATE_INIT;
+  initGame();
 }
 
 void loop() {
-
-  if (digitalRead(RESTART_BUTTON) == LOW) {
-    dfPlayer.stop();
-    while (Serial.available()) Serial.read();
-    delay(200);
-    state = STATE_INIT;
+  // Post-game auto-restart delay tracking loop
+  if (!isGameActive && (millis() - endScreenTime >= 5000)) {
+    initGame();
     return;
   }
 
-  switch (state) {
+  // Handle playing state updates
+  if (isGameActive) {
+    // Firing Request Handler
+    if (digitalRead(SHOOT_BUTTON) == LOW && !waitingForHit) {
+      Serial.write('F'); // Single-byte Fire token down hard wire to Worker
+      Serial.flush();
+      waitingForHit = true;
 
-    case STATE_INIT:
-      initGame();
-      break;
+      // Pass token out to sync the Processing screen animation update
+      Serial.print("FIRE\n");
+      Serial.flush();
 
-    case STATE_PLAYING: {
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("  ** FIRE! ** ");
+      lcd.setCursor(0, 1);
+      lcd.print(ballIsBig ? "Ball:BIG  +1pt" : "Ball:SML  +2pt");
 
-      if (digitalRead(SHOOT_BUTTON) == LOW && !waitingForHit) {
-        sendToWorker('F','I','R','E');
-        waitingForHit = true;
-
-        lcd.clear();
-        lcd.setCursor(0, 0);
-        lcd.print("  ** FIRE! **  ");
-        lcd.setCursor(0, 1);
-        lcd.print(ballIsBig ? "Ball:BIG  +1pt" : "Ball:SML  +2pt");
-
-        while (digitalRead(SHOOT_BUTTON) == LOW);
-        delay(200);
-      }
-
-      if (Serial.available() && waitingForHit) {
-        char hit = Serial.read();
-        int irIndex = hit - '1';
-
-        if (irIndex >= 0 && irIndex <= 4) {
-          waitingForHit = false;
-
-          bool thisBallBig = ballIsBig;
-          ballIsBig = !ballIsBig;
-
-          if (irIndex == allyIndex) {
-            updateLCD();
-            break;
-          }
-
-          if (!targetsHit[irIndex]) {
-            targetsHit[irIndex] = true;
-            targetsHitCount++;
-
-            int points = thisBallBig ? 1 : 2;
-            totalScore += points;
-
-            int targetNum = 0;
-            for (int i = 0; i < 4; i++) {
-              if (workingPlayers[i] == allyIndex) continue;
-              targetNum++;
-              if (workingPlayers[i] == irIndex) break;
-            }
-
-            playTrack(trackBase[allyIndex] + targetNum);
-
-            if (targetsHitCount >= 4 && totalScore >= 6) {
-              playTrack(trackBase[allyIndex] + 6);
-              lcd.clear();
-              lcd.setCursor(0, 0);
-              lcd.print("  ** YOU WIN ** ");
-              lcd.setCursor(0, 1);
-              lcd.print("Score:");
-              lcd.print(totalScore);
-              endScreenTime = millis();
-              state = STATE_WIN;
-              break;
-            }
-          }
-
-          updateLCD();
-        }
-      }
-      break;
+      while (digitalRead(SHOOT_BUTTON) == LOW);
+      delay(200); // Simple mechanical button debounce window
     }
 
-    case STATE_WIN:
-      if (millis() - endScreenTime >= 5000) {
-        state = STATE_INIT;
-      }
-      break;
+    // Inbound evaluation parsing from Worker via RX line
+    if (Serial.available() && waitingForHit) {
+      char hit = Serial.read();
+      int irIndex = hit - '1'; // Converts '1'-'5' array bounds back to 0-4
 
-    case STATE_LOSE:
-      if (millis() - endScreenTime >= 5000) {
-        state = STATE_INIT;
+      if (irIndex >= 0 && irIndex <= 4) {
+        waitingForHit = false;
+
+        bool thisBallBig = ballIsBig;
+        ballIsBig = !ballIsBig;
+
+        // Loss Condition Check: Friend Target Tripped
+        if (irIndex == allyIndex) {
+          isGameActive = false;
+          isGameLost = true;
+          
+          playTrack(trackBase[allyIndex] + 5); // Play lose track
+          
+          Serial.print("LOSE\n"); // Notify Processing over Bluetooth
+          Serial.flush();
+          
+          lcd.clear();
+          lcd.setCursor(0, 0);
+          lcd.print(" ** GAME OVER **");
+          lcd.setCursor(0, 1);
+          lcd.print("Hit Friend Ship!");
+          endScreenTime = millis();
+          return;
+        }
+
+        // Score Calculation & Hit Registry Updates
+        if (!targetsHit[irIndex]) {
+          targetsHit[irIndex] = true;
+          targetsHitCount++;
+
+          int points = thisBallBig ? 1 : 2;
+          totalScore += points;
+
+          // Notify Processing over Bluetooth to sink this specific ship item
+          Serial.print('H');
+          Serial.print(irIndex + 1); // Match 1-5 alignment metrics
+          Serial.print('\n');
+          Serial.flush();
+
+          int targetNum = 0;
+          for (int i = 0; i < 4; i++) {
+            if (workingPlayers[i] == allyIndex) continue;
+            targetNum++;
+            if (workingPlayers[i] == irIndex) break;
+          }
+
+          playTrack(trackBase[allyIndex] + targetNum);
+
+          // Win Evaluation Loop Validation
+          if (targetsHitCount >= 4 && totalScore >= 6) {
+            isGameActive = false;
+            isGameWon = true;
+            
+            playTrack(trackBase[allyIndex] + 6); // Play win track
+            
+            Serial.print("WIN\n");
+            Serial.flush();
+            
+            lcd.clear();
+            lcd.setCursor(0, 0);
+            lcd.print("  ** YOU WIN ** ");
+            lcd.setCursor(0, 1);
+            lcd.print("Score:");
+            lcd.print(totalScore);
+            endScreenTime = millis();
+            return;
+          }
+        }
+        updateLCD();
       }
-      break;
+    }
   }
 }
